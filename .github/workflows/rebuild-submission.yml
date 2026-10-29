@@ -1,0 +1,36 @@
+name: Rebuild competition submission
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out official competition branch
+        uses: actions/checkout@v4
+        with:
+          repository: oceanbase/seekdb
+          ref: 2026-competition
+          fetch-depth: 0
+          path: source
+
+      - name: Apply the completed three-task snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_COMMIT: ad54ba857f1c4da9a52e40e022fba6b14cb5304b
+          OFFICIAL_BASE: 5bce9e06d1281347ad61344e4b01fab9158c58a2
+        run: |
+          cd source
+          git remote add registration "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch registration submission/all-three
+          git diff --binary "${OFFICIAL_BASE}" "${SNAPSHOT_COMMIT}" > ../submission.patch
+          git checkout -B competition/all-three "${OFFICIAL_BASE}"
+          git apply --index --3way ../submission.patch
+          git config user.name "competition-submission"
+          git config user.email "1523196558zz-max@users.noreply.github.com"
+          git commit -m "Complete file SQL, AI functions, and AI columns"
+          git push --force registration HEAD:refs/heads/competition/all-three
