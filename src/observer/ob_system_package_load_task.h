@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) 2025 OceanBase.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef _OCEANBASE_ROOTSERVER_OB_SYSTEM_PACKAGE_LOAD_TASK_H_
+#define _OCEANBASE_ROOTSERVER_OB_SYSTEM_PACKAGE_LOAD_TASK_H_ 1
+
+#include "common/ob_timeout_ctx.h"
+#include "lib/task/ob_timer.h"
+#include "lib/lock/ob_mutex.h"
+#include "lib/utility/ob_macro_utils.h"
+#include "share/ob_define.h"
+
+namespace oceanbase
+{
+namespace rootserver
+{
+class ObSystemPackageLoadTask : public common::ObTimerTask
+{
+public:
+  ObSystemPackageLoadTask();
+  virtual ~ObSystemPackageLoadTask() {}
+
+  int init();
+  bool is_inited() const { return inited_; }
+  int start(common::ObTimer &timer);
+  void stop(common::ObTimer &timer);
+  void destroy();
+
+  virtual void runTimerTask() override;
+
+  static int wait_system_package_ready(const common::ObTimeoutCtx &ctx);
+
+private:
+  int load_system_package_();
+
+private:
+  bool inited_;
+  int64_t fail_count_;
+  // only one thread may compile the system packages at a time
+  lib::ObMutex load_lock_;
+  // The first tick is what unblocks the first `call <package>` statement of
+  // a cold server, so keep the cadence short; once loaded the task only
+  // reads the ready flag.
+  static const int64_t SCHEDULE_INTERVAL_US = 300 * 1000L; // 300ms
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSystemPackageLoadTask);
+};
+}
+}
+
+#endif // _OCEANBASE_ROOTSERVER_OB_SYSTEM_PACKAGE_LOAD_TASK_H_
