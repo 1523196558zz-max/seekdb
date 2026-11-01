@@ -1,0 +1,104 @@
+# FTS 全文索引性能基准（本地测量通道）
+# 复刻官方 VLDB CI 的 fts_large_bench 流程：构建 → sdb 启动 → 压测 → 评分
+# 仅用于 fts-opt 分支的优化迭代测量，不影响官方判题。
+name: FTS Bench
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fts-opt]
+
+jobs:
+  fts-bench:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Free Disk Space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - uses: actions/checkout@v3
+
+      - name: Install ubuntu environment
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
+
+      - name: Cache deps
+        id: cache-deps
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-deps
+        with:
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-el9.x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+          path: deps/3rd
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          crates-mirror: 'false'
+          cache: 'true'
+
+      - name: Initialize release build
+        shell: bash
+        run: |
+          ./build.sh release --init
+          echo "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/bin" >> "$GITHUB_PATH"
+
+      - name: Build release Unity binary
+        shell: bash
+        run: |
+          cd build_release && make -j4
+          test -x src/observer/seekdb
+
+      - name: Start seekdb
+        shell: bash
+        run: |
+          export PATH="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/lib:$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib:${LD_LIBRARY_PATH:-}"
+          python3 .github/script/seekdb/sdb.py start \
+            --binary build_release/src/observer/seekdb \
+            --base-dir /tmp/seekdb-instance \
+            --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$GITHUB_WORKSPACE/deps/3rd/u01/obclient/bin/obclient" \
+            --base-dir /tmp/seekdb-instance \
+            --host 127.0.0.1 \
+            --port 2881 \
+            --user root \
+            --timeout 300
+
+      - name: Run FTS large benchmark
+        shell: bash
+        run: |
+          export PATH="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/lib:$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib:${LD_LIBRARY_PATH:-}"
+          export MYSQL="obclient -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4"
+          export MYSQL_VERBOSE="obclient -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4"
+          export LABEL="fts-opt@${GITHUB_SHA::8}"
+          export OUTPUT="$GITHUB_WORKSPACE/report.txt"
+          bash tools/benchmark/fts_large_bench.sh
+
+      - name: Score against baseline
+        shell: bash
+        run: |
+          python3 tools/benchmark/fts_large_bench_score.py report.txt | tee score.txt
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-bench-artifacts
+          path: |
+            report.txt
+            score.txt
+          retention-days: 30
