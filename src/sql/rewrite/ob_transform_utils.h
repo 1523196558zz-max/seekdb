@@ -1881,7 +1881,7 @@ public:
                                                    bool &is_contain);
   // check whether the score calculated by match expr is actually utilized
   static int check_need_calc_match_score(ObExecContext *exec_ctx,
-                                         ObDMLStmt *stmt,
+                                         const ObDMLStmt *stmt,
                                          ObRawExpr *match_expr,
                                          bool &need_calc,
                                          ObIArray<ObExprConstraint> &constraints);

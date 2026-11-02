@@ -12904,7 +12904,7 @@ private:
 };
 
 int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
-                                                  ObDMLStmt *stmt,
+                                                  const ObDMLStmt *stmt,
                                                   ObRawExpr *match_expr,
                                                   bool &need_calc,
                                                   ObIArray<ObExprConstraint> &constraints)
@@ -12918,7 +12918,7 @@ int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
   } else {
     need_calc = false;
     getter.checker_ = &checker;
-    if (OB_FAIL(stmt->iterate_stmt_expr(getter))) {
+    if (OB_FAIL(const_cast<ObDMLStmt *>(stmt)->iterate_stmt_expr(getter))) {
       LOG_WARN("failed to iterate stmt exprs", K(ret));
     } else if (!found) {
       // defensive: if the match expr is not found in any stmt expr, keep the score
