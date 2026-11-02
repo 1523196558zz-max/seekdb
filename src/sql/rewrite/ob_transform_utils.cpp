@@ -21,6 +21,7 @@
 #include "sql/rewrite/ob_equal_analysis.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
+#include "sql/resolver/dml/ob_stmt_expr_visitor.h"
 #include "sql/rewrite/ob_transform_pre_process.h"
 #include "sql/rewrite/ob_expand_aggregate_utils.h"
 #include "sql/ob_sql_utils.h"
@@ -12853,6 +12854,75 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
       } else if (tmp_need_calc) {
         need_calc = true;
       }
+    }
+  }
+  return ret;
+}
+
+class ObTransformUtils::NeedCalcMatchScoreChecker : public RelExprCheckerBase
+{
+public:
+  NeedCalcMatchScoreChecker(ObExecContext *exec_ctx,
+                            ObRawExpr *match_expr,
+                            bool &need_calc,
+                            bool &found,
+                            ObIArray<ObExprConstraint> &constraints)
+      : exec_ctx_(exec_ctx),
+        match_expr_(match_expr),
+        need_calc_(need_calc),
+        found_(found),
+        constraints_(constraints)
+  {
+  }
+  int add_expr(ObRawExpr *&expr) override
+  {
+    int ret = OB_SUCCESS;
+    // the bare match expr registered in stmt match_exprs_ is not a usage of its score
+    if (OB_NOT_NULL(expr) && expr != match_expr_ && expr->has_flag(CNT_MATCH_EXPR)) {
+      found_ = true;
+      if (!need_calc_) {
+        bool tmp_need_calc = false;
+        if (OB_FAIL(ObTransformUtils::inner_check_need_calc_match_score(exec_ctx_,
+                                                                        expr,
+                                                                        match_expr_,
+                                                                        tmp_need_calc,
+                                                                        constraints_))) {
+          LOG_WARN("failed to inner check need calc match score", K(ret));
+        } else if (tmp_need_calc) {
+          need_calc_ = true;
+        }
+      }
+    }
+    return ret;
+  }
+private:
+  ObExecContext *exec_ctx_;
+  ObRawExpr *match_expr_;
+  bool &need_calc_;
+  bool &found_;
+  ObIArray<ObExprConstraint> &constraints_;
+};
+
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  ObStmtExprGetter getter;
+  bool found = false;
+  NeedCalcMatchScoreChecker checker(exec_ctx, match_expr, need_calc, found, constraints);
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    need_calc = false;
+    getter.checker_ = &checker;
+    if (OB_FAIL(stmt->iterate_stmt_expr(getter))) {
+      LOG_WARN("failed to iterate stmt exprs", K(ret));
+    } else if (!found) {
+      // defensive: if the match expr is not found in any stmt expr, keep the score
+      need_calc = true;
     }
   }
   return ret;
