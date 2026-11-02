@@ -74,16 +74,26 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (word.get_collation_type() == stopword_type_.get_collation_type()) {
+    // same collation: no conversion needed, avoid per-token allocator setup
+    ret = stopword_set_.exist_refactored(word);
+    if (OB_HASH_NOT_EXIST == ret) {
+      is_stopword = false;
+      ret = OB_SUCCESS;
+    } else if (OB_HASH_EXIST == ret) {
+      is_stopword = true;
+      ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+    }
   } else {
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
     if (OB_FAIL(common::ObCharset::charset_convert(
                                        allocator,
                                        word.get_word().get_string(),
@@ -158,12 +168,27 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+bool ObAddWord::need_case_down(const ObString &word)
+{
+  // lowercasing is a no-op for any collation unless the word contains an
+  // ASCII uppercase letter or a multi-byte character.
+  const unsigned char *bytes = reinterpret_cast<const unsigned char *>(word.ptr());
+  for (int64_t i = 0; i < word.length(); ++i) {
+    if (bytes[i] >= 0x80 || (bytes[i] >= 'A' && bytes[i] <= 'Z')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (flag_.casedown()) {
+  } else if (!flag_.casedown() || !need_case_down(src.get_word().get_string())) {
+    dst = src;
+  } else {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
                     word_meta_.get_collation_type(),
@@ -174,8 +199,6 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
       ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
       dst = tmp;
     }
-  } else {
-    dst = src;
   }
   return ret;
 }

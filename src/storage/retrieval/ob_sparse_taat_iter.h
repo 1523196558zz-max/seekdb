@@ -17,6 +17,8 @@
 #ifndef OB_SPARSE_TAAT_ITER_H_
 #define OB_SPARSE_TAAT_ITER_H_
 
+#include "lib/hash/ob_hashset.h"
+#include "lib/string/ob_string.h"
 #include "query/engine/basic/ob_spill_row_store.h"
 #include "ob_i_sparse_retrieval_iter.h"
 
@@ -52,6 +54,7 @@ protected:
   typedef hash::ObHashMap<ObDocIdExt, double> ObSRTaaTHashMap;
   static const int64_t OB_MAX_HASHMAP_COUNT = 20;
   static const int64_t OB_HASHMAP_DEFAULT_SIZE = 1000;
+  static const int64_t OB_EARLY_EXIT_MAX_TARGET = 1000;
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
   ObISparseRetrievalDimIter *dim_iter_;
@@ -66,6 +69,10 @@ protected:
   ObDocIdExt cache_first_id_;
   bool are_chunk_stores_inited_;
   bool are_chunk_stores_filled_;
+  bool early_exit_enabled_;
+  int64_t early_exit_target_;
+  int64_t early_exit_seen_cnt_;
+  hash::ObHashSet<common::ObString> early_exit_seen_set_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRTaaTIterImpl);

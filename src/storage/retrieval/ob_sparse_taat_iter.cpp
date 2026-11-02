@@ -39,6 +39,10 @@ ObSRTaaTIterImpl::ObSRTaaTIterImpl()
     cache_first_id_(),
     are_chunk_stores_inited_(false),
     are_chunk_stores_filled_(false),
+    early_exit_enabled_(false),
+    early_exit_target_(0),
+    early_exit_seen_cnt_(0),
+    early_exit_seen_set_(),
     set_datum_func_(nullptr)
 {
 }
@@ -103,6 +107,12 @@ void ObSRTaaTIterImpl::reuse(const bool switch_tablet)
   cache_first_id_.reset();
   are_chunk_stores_inited_ = false;
   are_chunk_stores_filled_ = false;
+  if (early_exit_seen_set_.created()) {
+    early_exit_seen_set_.destroy();
+  }
+  early_exit_enabled_ = false;
+  early_exit_target_ = 0;
+  early_exit_seen_cnt_ = 0;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
 }
@@ -240,6 +250,24 @@ int ObSRTaaTIterImpl::init_chunk_stores()
         skips_[i] = skip;
       }
     }
+    if (OB_FAIL(ret)) {
+    } else {
+      const bool limit_valid = OB_NOT_NULL(iter_param_->limit_param_)
+          && iter_param_->limit_param_->is_valid();
+      const int64_t limit_target = limit_valid
+          ? iter_param_->limit_param_->limit_ + iter_param_->limit_param_->offset_
+          : -1;
+      if (limit_target > 0 && limit_target <= OB_EARLY_EXIT_MAX_TARGET) {
+        early_exit_target_ = limit_target;
+        early_exit_seen_cnt_ = 0;
+        if (OB_FAIL(early_exit_seen_set_.create(
+                static_cast<int64_t>(MIN(early_exit_target_ * 2 + 1, 256)),
+                common::ObMemAttr("FTSLimitSeen")))) {
+        } else {
+          early_exit_enabled_ = true;
+        }
+      }
+    }
     if (OB_SUCC(ret)) {
       are_chunk_stores_inited_ = true;
     }
@@ -266,9 +294,10 @@ int ObSRTaaTIterImpl::fill_chunk_stores()
 
     for (int64_t dim_idx = 0; OB_SUCC(ret); ) {
       int64_t subtotal_count = 0;
+      bool stop_fill = false;
       if (iter_param_->id_proj_expr_->is_batch_result()) {
         // batched
-        while (OB_SUCC(ret)) {
+        while (OB_SUCC(ret) && !stop_fill) {
           int64_t count = 0;
           if (OB_FAIL(dim_iter_->get_next_batch(capacity, count))) {
             if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -280,34 +309,75 @@ int ObSRTaaTIterImpl::fill_chunk_stores()
             for (int64_t i = 0; i < partition_cnt_; ++i) {
               skips_[i]->set_all(capacity);
             }
-            for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
-              const ObDatum &id_datum = iter_param_->id_proj_expr_->locate_expr_datum(*eval_ctx, i);
-              if (OB_UNLIKELY(id_datum.is_null()) || OB_ISNULL(id_datum.ptr_)) {
-                ret = OB_ERR_UNEXPECTED;
-              } else {
-                uint64_t partition = murmurhash(id_datum.ptr_, id_datum.len_, 0) % partition_cnt_;
-                skips_[partition]->unset(i);
+            int64_t effective_count = count;
+            if (early_exit_enabled_) {
+              int64_t truncate_at = count;
+              for (int64_t i = 0; OB_SUCC(ret) && i < count && truncate_at == count; ++i) {
+                const ObDatum &id_datum = iter_param_->id_proj_expr_->locate_expr_datum(*eval_ctx, i);
+                if (OB_UNLIKELY(id_datum.is_null()) || OB_ISNULL(id_datum.ptr_)) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else {
+                  uint64_t partition = murmurhash(id_datum.ptr_, id_datum.len_, 0) % partition_cnt_;
+                  skips_[partition]->unset(i);
+                  int hash_ret = early_exit_seen_set_.exist_refactored(
+                      common::ObString(id_datum.len_, id_datum.ptr_));
+                  if (OB_HASH_NOT_EXIST == hash_ret) {
+                    common::ObString id_key;
+                    if (OB_FAIL(ob_write_string(*iter_allocator_,
+                            common::ObString(id_datum.len_, id_datum.ptr_), id_key))) {
+                    } else if (OB_FAIL(early_exit_seen_set_.set_refactored(id_key))) {
+                    } else if (++early_exit_seen_cnt_ >= early_exit_target_) {
+                      truncate_at = i + 1;
+                    }
+                  } else if (OB_HASH_EXIST != hash_ret) {
+                    ret = hash_ret;
+                  } else {
+                    // duplicate docid, skip
+                  }
+                }
+              }
+              if (OB_SUCC(ret) && truncate_at < count) {
+                for (int64_t i = truncate_at; i < count; ++i) {
+                  for (int64_t p = 0; p < partition_cnt_; ++p) {
+                    skips_[p]->set(i);
+                  }
+                }
+                effective_count = truncate_at;
+              }
+            } else {
+              for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+                const ObDatum &id_datum = iter_param_->id_proj_expr_->locate_expr_datum(*eval_ctx, i);
+                if (OB_UNLIKELY(id_datum.is_null()) || OB_ISNULL(id_datum.ptr_)) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else {
+                  uint64_t partition = murmurhash(id_datum.ptr_, id_datum.len_, 0) % partition_cnt_;
+                  skips_[partition]->unset(i);
+                }
               }
             }
             int64_t check_count = 0;
             for (int64_t i = 0; OB_SUCC(ret) && i < partition_cnt_; ++i) {
               int64_t stored_count = 0;
               if (OB_FAIL(query::spill_row_store_add_batch(
-                  datum_stores_[i], exprs, *eval_ctx, *skips_[i], count,
+                  datum_stores_[i], exprs, *eval_ctx, *skips_[i], effective_count,
                   stored_count))) {
               } else {
                 check_count += stored_count;
                 subtotal_count += stored_count;
               }
             }
-            if (OB_SUCC(ret) && count != check_count) {
+            if (OB_SUCC(ret) && effective_count != check_count) {
               ret = OB_ERR_UNEXPECTED;
+            }
+            if (OB_SUCC(ret) && early_exit_enabled_
+                && early_exit_seen_cnt_ >= early_exit_target_) {
+              stop_fill = true;
             }
           }
         }
       } else {
         // non-batched
-        while (OB_SUCC(ret)) {
+        while (OB_SUCC(ret) && !stop_fill) {
           if (OB_FAIL(dim_iter_->get_next_row())) {
             if (OB_UNLIKELY(OB_ITER_END != ret)) {
             }
@@ -321,6 +391,23 @@ int ObSRTaaTIterImpl::fill_chunk_stores()
                   datum_stores_[partition], exprs, *eval_ctx))) {
               } else {
                 ++subtotal_count;
+                if (early_exit_enabled_) {
+                  int hash_ret = early_exit_seen_set_.exist_refactored(
+                      common::ObString(id_datum.len_, id_datum.ptr_));
+                  if (OB_HASH_NOT_EXIST == hash_ret) {
+                    common::ObString id_key;
+                    if (OB_FAIL(ob_write_string(*iter_allocator_,
+                            common::ObString(id_datum.len_, id_datum.ptr_), id_key))) {
+                    } else if (OB_FAIL(early_exit_seen_set_.set_refactored(id_key))) {
+                    } else if (++early_exit_seen_cnt_ >= early_exit_target_) {
+                      stop_fill = true;
+                    }
+                  } else if (OB_HASH_EXIST != hash_ret) {
+                    ret = hash_ret;
+                  } else {
+                    // duplicate docid, skip
+                  }
+                }
               }
             }
           }
@@ -333,7 +420,9 @@ int ObSRTaaTIterImpl::fill_chunk_stores()
       if (OB_SUCC(ret)) {
         total_count += subtotal_count;
         eval_ctx->reuse(eval_ctx->get_batch_size());
-        if (OB_FAIL(update_dim_iter(++dim_idx))) {
+        if (stop_fill) {
+          break;
+        } else if (OB_FAIL(update_dim_iter(++dim_idx))) {
           if (OB_ITER_END != ret) {
           }
         }
@@ -342,6 +431,8 @@ int ObSRTaaTIterImpl::fill_chunk_stores()
 
     if (OB_LIKELY(OB_ITER_END == ret)) {
       ret = OB_SUCCESS;
+    }
+    if (OB_SUCC(ret)) {
       int64_t check_count = 0;
       for (int64_t i = 0; OB_SUCC(ret) && i < partition_cnt_; ++i) {
         if (OB_FAIL(query::init_spill_row_store_iterator(
