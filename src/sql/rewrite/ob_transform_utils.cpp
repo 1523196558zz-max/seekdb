@@ -12805,6 +12805,8 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+// Non-recursive on purpose: a nested T_OP_BOOL(match) (e.g. NOT MATCH(...)) still
+// consumes the score value, so only these exact top-level forms are score-free.
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObRawExpr* expr, 
                                                         ObRawExpr* match_expr, 
@@ -12812,47 +12814,26 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObIArray<ObExprConstraint> &constraints)
 {
   int ret = OB_SUCCESS;
-  need_calc = false;
-  bool need_check_child = true;
+  need_calc = true;
   if (OB_ISNULL(expr) || OB_ISNULL(match_expr)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (expr == match_expr) {
-    need_calc = true;
-    need_check_child = false;
-  } else if (expr->get_expr_type() == T_OP_GT || expr->get_expr_type() == T_OP_LT) {
-    ObRawExpr *gt_param = NULL;
-    ObRawExpr *lt_param = NULL;
-    bool is_param_zero = false;
-    if (expr->get_param_count() != 2 || OB_ISNULL(expr->get_param_expr(0)) || 
-        OB_ISNULL(expr->get_param_expr(1))) {
-      ret = OB_INVALID_ARGUMENT;
-    } else if (OB_FALSE_IT(gt_param = expr->get_expr_type() == T_OP_GT ? expr->get_param_expr(0) : 
-                                                                         expr->get_param_expr(1))) {
-    } else if (OB_FALSE_IT(lt_param = expr->get_expr_type() == T_OP_GT ? expr->get_param_expr(1) : 
-                                                                         expr->get_param_expr(0))) {
-    } else if (gt_param != match_expr) {
-      /* do nothing */
-    } else if (OB_FAIL(check_expr_eq_zero(exec_ctx, lt_param, is_param_zero, constraints))) {
-    } else if (is_param_zero) {
-      need_calc = false;
-      need_check_child = false;
-    }
   } else if (expr->get_expr_type() == T_OP_BOOL) {
-    if (expr->get_param_count() == 1 && expr->get_param_expr(0) == match_expr) {
-      need_calc = false;
-      need_check_child = false;
-    }
-  }
-  if (OB_SUCC(ret) && need_check_child) {
-    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < expr->get_param_count(); i++) {
-      bool tmp_need_calc = false;
-      if (OB_FAIL(SMART_CALL(inner_check_need_calc_match_score(exec_ctx,
-                                                              expr->get_param_expr(i), 
-                                                              match_expr, 
-                                                              tmp_need_calc,
-                                                              constraints)))) {
-      } else if (tmp_need_calc) {
-        need_calc = true;
+    need_calc = !(expr->get_param_count() == 1 && expr->get_param_expr(0) == match_expr);
+  } else if (expr->get_expr_type() == T_OP_GT || expr->get_expr_type() == T_OP_LT) {
+    bool is_param_zero = false;
+    if (expr->get_param_count() != 2 || OB_ISNULL(expr->get_param_expr(0)) ||
+        OB_ISNULL(expr->get_param_expr(1))) {
+      /* keep need_calc */
+    } else {
+      ObRawExpr *gt_param = expr->get_expr_type() == T_OP_GT ? expr->get_param_expr(0) : 
+                                                               expr->get_param_expr(1);
+      ObRawExpr *lt_param = expr->get_expr_type() == T_OP_GT ? expr->get_param_expr(1) : 
+                                                               expr->get_param_expr(0);
+      if (gt_param != match_expr) {
+        /* keep need_calc */
+      } else if (OB_FAIL(check_expr_eq_zero(exec_ctx, lt_param, is_param_zero, constraints))) {
+      } else if (is_param_zero) {
+        need_calc = false;
       }
     }
   }
@@ -12903,6 +12884,31 @@ private:
   ObIArray<ObExprConstraint> &constraints_;
 };
 
+// A match expr appearing in a value context (select item, order by, group by,
+// having, qualify, limit) always consumes the real score value.
+class ObTransformUtils::MatchScoreValueUsageChecker : public RelExprCheckerBase
+{
+public:
+  MatchScoreValueUsageChecker(ObRawExpr *match_expr,
+                              bool &need_calc)
+      : match_expr_(match_expr),
+        need_calc_(need_calc)
+  {
+  }
+  int add_expr(ObRawExpr *&expr) override
+  {
+    int ret = OB_SUCCESS;
+    if (OB_NOT_NULL(expr) && !need_calc_ &&
+        (expr == match_expr_ || expr->has_flag(CNT_MATCH_EXPR))) {
+      need_calc_ = true;
+    }
+    return ret;
+  }
+private:
+  ObRawExpr *match_expr_;
+  bool &need_calc_;
+};
+
 int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
                                                   const ObDMLStmt *stmt,
                                                   ObRawExpr *match_expr,
@@ -12913,14 +12919,28 @@ int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
   ObStmtExprGetter getter;
   bool found = false;
   NeedCalcMatchScoreChecker checker(exec_ctx, match_expr, need_calc, found, constraints);
+  ObStmtExprGetter value_getter;
+  MatchScoreValueUsageChecker value_checker(match_expr, need_calc);
   if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     need_calc = false;
     getter.checker_ = &checker;
+    value_getter.remove_all();
+    value_getter.add_scope(SCOPE_SELECT);
+    value_getter.add_scope(SCOPE_ORDERBY);
+    value_getter.add_scope(SCOPE_GROUPBY);
+    value_getter.add_scope(SCOPE_HAVING);
+    value_getter.add_scope(SCOPE_QUALIFY_FILTER);
+    value_getter.add_scope(SCOPE_LIMIT);
+    value_getter.add_scope(SCOPE_SELECT_INTO);
+    value_getter.checker_ = &value_checker;
     if (OB_FAIL(const_cast<ObDMLStmt *>(stmt)->iterate_stmt_expr(getter))) {
       LOG_WARN("failed to iterate stmt exprs", K(ret));
-    } else if (!found) {
+    } else if (!need_calc &&
+               OB_FAIL(const_cast<ObDMLStmt *>(stmt)->iterate_stmt_expr(value_getter))) {
+      LOG_WARN("failed to iterate stmt exprs for match value usage", K(ret));
+    } else if (!found && !need_calc) {
       // defensive: if the match expr is not found in any stmt expr, keep the score
       need_calc = true;
     }

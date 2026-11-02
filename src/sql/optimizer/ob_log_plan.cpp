@@ -12093,7 +12093,11 @@ int ObLogPlan::prepare_text_retrieval_lookup(const ObIArray<ObRawExpr *> &lookup
                                                    lookup_index_ids.at(i),
                                                    curr_match_expr,
                                                    tr_info))) {
-    } else if (OB_FAIL(table_scan->get_lookup_tr_infos().push_back(tr_info))) {
+    } else {
+      // lookup dim iters read the real score from the forward index
+      tr_info.need_calc_relevance_ = true;
+      if (OB_FAIL(table_scan->get_lookup_tr_infos().push_back(tr_info))) {
+      }
     }
   }
 
@@ -12129,6 +12133,7 @@ int ObLogPlan::prepare_text_retrieval_match_score(const ObIArray<ObRawExpr *> &m
                                                    match_score_index_ids.at(i),
                                                    curr_match_expr,
                                                    tr_info))) {
+    } else if (FALSE_IT(tr_info.need_calc_relevance_ = true)) {
     } else if (prev_match_expr == curr_match_expr && FALSE_IT(column_boost_idx = column_boost_idx + 1)) {
     } else if (prev_match_expr != curr_match_expr && FALSE_IT(column_boost_idx = 0)) {
     } else if (FALSE_IT(prev_match_expr = curr_match_expr)) {
@@ -12164,6 +12169,7 @@ int ObLogPlan::prepare_text_retrieval_merge(const ObIArray<ObRawExpr *> &merge_m
                                                    merge_index_ids.at(i),
                                                    curr_match_expr,
                                                    tr_info))) {
+    } else if (FALSE_IT(tr_info.need_calc_relevance_ = true)) {
     } else if (OB_FAIL(table_scan->get_merge_tr_infos().push_back(tr_info))) {
     }
   }
@@ -12272,6 +12278,10 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
                                                               need_calc_relevance,
                                                               constraints))) {
       LOG_WARN("failed to check need calc relevance", K(ret));
+    } else if (!need_calc_relevance && NATURAL_LANGUAGE_MODE != match_against->get_mode_flag()) {
+      // the no-calc path projects membership counts instead of the true score, which
+      // only preserves semantics of natural language mode boolean filters
+      need_calc_relevance = true;
     } else if (!need_calc_relevance &&
                OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
       LOG_WARN("failed to append array no dup", K(ret));

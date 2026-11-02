@@ -2051,6 +2051,7 @@ private:
                                               bool &need_calc,
                                               ObIArray<ObExprConstraint> &constraints);
   class NeedCalcMatchScoreChecker;
+  class MatchScoreValueUsageChecker;
   static int check_stmt_can_trans_as_exists(ObSelectStmt *stmt,
                                             ObTransformerCtx *ctx,
                                             bool is_correlated,
